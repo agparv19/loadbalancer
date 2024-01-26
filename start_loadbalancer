@@ -1,0 +1,183 @@
+#!/usr/bin/env python3
+"""
+Usage: /start_loadbalancer -lp <port> -sp [p1, p2, p3, p4, ...] -ht <time>
+
+for webservers running at LOCALHOST:p1, p2, p3, p4 ...
+and loadbalancer running at loadbalancer <port> with server
+health check time period <time>
+
+"""
+
+import argparse
+import asyncio
+import ast
+import util
+import time
+import aiohttp
+
+SERVERS = []
+DEAD = {}
+
+# just a persistent count
+class Index:
+    count = 0
+
+def get_port():
+    global SERVERS
+    global DEAD
+    if len(DEAD.keys()) == len(SERVERS):
+        # all servers dead
+        return -1
+    # Basic round robin 
+    res = Index.count 
+    Index.count += 1
+    Index.count = Index.count % len(SERVERS)
+    if DEAD.get(SERVERS[res]):
+        # try another port
+        return get_port()
+    else:
+        return SERVERS[res]
+
+async def send_http_request(host, port, endpoint):
+    start = time.time()
+    res = None
+    status = None
+    url = f"http://{host}:{port}{endpoint}"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                res = await response.text()
+                status = response.status
+                end = time.time()
+                #print(f"Server at port:{port} replied: {url}"
+                #      f" took {(end-start)*1000:.2f} ms")
+    except aiohttp.ClientConnectionError:
+        status = -1
+        res = ""
+    return (status, res)
+
+
+async def forward_request(client_socket, client_address):
+    try:
+        loop = asyncio.get_event_loop()
+        try:
+            data = (await loop.sock_recv(client_socket, util.MAX_DATA_SIZE)).decode(util.STYLE)
+            lines = data.split('\r\n')
+            if lines:
+                line = lines[0]
+                words = line.split(' ')
+                endpoint = "" if len(words) < 2 else words[1]
+                forward_port = get_port()
+                status = 200
+                content = None
+                if forward_port == -1:
+                    content = "Unable to serve request, all backend servers are dead!"
+                else:
+                    status, content = await send_http_request(util.LOCALHOST, forward_port, endpoint)
+                    if status == -1:
+                        # Request was sent to a dead server
+                        # Possibly b/w two health check runs
+                        status = 200
+                        content = "Please try again!"
+                        print(f"Server {forward_port} is dead!")
+                        DEAD[forward_port] = 1
+                response_code = status
+                # Create the response
+                response = f"HTTP/1.1 {response_code}\r\n\r\n"
+                if content:
+                    response += f"{content}\r\n"
+                # Respond to the client
+                await loop.sock_sendall(client_socket, response.encode(util.STYLE))
+        except Exception as e:
+            print(str(e))
+        finally:
+            if client_socket:
+                client_socket.close()
+                print(f"Closed the connection from {client_address}")
+    except asyncio.CancelledError:
+        print("[handle_request] Coroutine cancelled....")
+
+
+async def check_server_health(time_period):
+    global SERVERS
+    global DEAD
+    while True:
+        for server in SERVERS:
+            status, content = await send_http_request(util.LOCALHOST, server, "/health")
+            if status == 200:
+                if DEAD.get(server) is not None:
+                    DEAD.pop(server)
+            else:
+                print(f"Server {server} is dead!")
+                DEAD[server] = 1
+        await asyncio.sleep(time_period)
+
+
+async def handle_connections(server_socket, health_time_period):
+    """
+    Accepts HTTP requests (forever) listening on
+    server_socket
+    """
+    try:
+        print(f"Load Balancer started at {server_socket.getsockname()}")
+        loop = asyncio.get_event_loop()
+        loop.create_task(check_server_health(health_time_period))
+        while True:
+            try:
+                # Wait for a connection
+                # In async mode, note that this won't really wait but 'await'
+                client_socket, client_address = await loop.sock_accept(server_socket) 
+                print(f"Received a new connection from {client_address}")
+                # this creates and runs the task asynchronously
+                loop.create_task(forward_request(client_socket, client_address))
+            except Exception as e:
+                print(str(e))
+    except asyncio.CancelledError:
+        print("[handle_connections] Coroutine cancelled....")
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="A script to start a loadbalancer") 
+    parser.add_argument('-lp', '--lbport', type=int, help='Port to start loadbalancer on.')
+    parser.add_argument('-sp', '--ports', type=str, help='Port list of webservers to send load to.') 
+    parser.add_argument('-ht', '--health', type=int, help='Time period to run health check on servers.') 
+    args = parser.parse_args()
+    if args.lbport is None:
+        raise ValueError("Please specify a port to start load balancer on using -lp")
+    if args.ports is None:
+        raise ValueError("Please specify ports to send load on # using -sp")
+    if args.health is None:
+        raise ValueError("Please specify time period for health check on servers using -ht")
+    return args
+
+
+def main():
+    args = get_args()
+    global SERVERS
+    SERVERS = ast.literal_eval(args.ports)
+    server_socket = None
+    try:
+        # start socket for load balancer
+        server_socket = util.setup_server(util.LOCALHOST, args.lbport)
+    except Exception as e:
+        print(str(e))
+        print("setup_server failed! Exiting...")
+        return
+    
+    if server_socket is None:
+        print("Invalid server socket. Exiting")
+        return
+    
+    try:
+        asyncio.run(handle_connections(server_socket, args.health))
+    except KeyboardInterrupt:
+        print(f"\nExiting due to a Keyboard interrupt\n")
+    finally:
+        print("Load Balancer server is shutting down.")
+        # Close the server socket
+        if server_socket:
+            server_socket.close()
+
+
+if __name__ == "__main__":
+    main()

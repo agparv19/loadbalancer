@@ -1,0 +1,170 @@
+#!/usr/bin/env python3
+"""
+Usage: ./start_async_server -p <port>
+
+This will create a async HTTP server listening at LOCALHOST:port
+
+"""
+import os
+import asyncio
+import threading
+import aiofiles
+import argparse
+import util
+
+
+async def cpu_bound_task():
+    # no point in making this async as it will
+    # never call await and thus will not be a 
+    # coperative coroutine!
+
+    print("Running cpu bound task")
+    # a dummy cpu bound task
+    n = 100
+    def is_prime(n):
+        if n <= 1:
+            return False
+        elif n == 2:
+            return True
+        elif n % 2 == 0:
+            return False
+        else:
+            for i in range(3, int(n**0.5) + 1, 2):
+                if n % i == 0:
+                    return False
+            return True
+    def find_primes_in_range(start, end):
+        primes = []
+        for number in range(start, end + 1):
+            if is_prime(number):
+                primes.append(number)
+        return primes
+    res = find_primes_in_range(1, 1000000)
+
+
+async def io_bound_task():
+    print("Running i/o bound task")
+    # simulates a file read or any other
+    # operation that requires i/o
+    await asyncio.sleep(1)
+
+
+def health_check():
+    return "I am up and running!"
+
+
+async def get_page(path):
+
+    # special set-up for testing
+    if path == "/cpu":
+        path = "/"
+        await cpu_bound_task()
+    
+    if path == "/io":
+        path = "/"
+        await io_bound_task()
+
+    if path == "/health":
+        return health_check()
+
+    WEB_DIR = "www" # a dir to store all webpages
+    if path == "":
+        return None
+    if path == "/":
+        path = "/index.html"
+
+    try:
+        async with aiofiles.open(WEB_DIR + path, 'r') as file:
+            content = await file.read()
+        return content
+    except FileNotFoundError as f:
+        return None
+
+
+async def handle_request(client_socket, client_address):
+    try:
+        loop = asyncio.get_event_loop()
+        try:
+            data = (await loop.sock_recv(client_socket, util.MAX_DATA_SIZE)).decode(util.STYLE)
+            lines = data.split('\r\n')
+            if lines:
+                line = lines[0]
+                words = line.split(' ')
+                path = "" if len(words) < 2 else words[1]
+                content = await get_page(path)
+                response_code = "200 OK" if content else "404 Not Found"
+                # Create the response
+                response = f"HTTP/1.1 {response_code}\r\n\r\n"
+                if content:
+                    response += f"{content}\r\n"
+                # Respond to the client
+                await loop.sock_sendall(client_socket, response.encode(util.STYLE))
+        except Exception as e:
+            print(str(e))
+        finally:
+            if client_socket:
+                client_socket.close()
+                print(f"Closed the connection from {client_address}")
+    except asyncio.CancelledError:
+        print("[handle_request] Coroutine cancelled....")
+
+
+async def handle_connections(server_socket):
+    """
+    Accepts HTTP requests (forever) listening on
+    server_socket
+    """
+    try:
+        print(f"Handling connection for {server_socket.getsockname()}, pid: {os.getpid()}, tid: {threading.get_ident()}")
+        loop = asyncio.get_event_loop()
+        while True:
+            try:
+                # Wait for a connection
+                # In async mode, note that this won't really wait but 'await'
+                client_socket, client_address = await loop.sock_accept(server_socket) 
+                print(f"Received a new connection from {client_address}")
+                # this creates and runs the task asynchronously
+                loop.create_task(handle_request(client_socket, client_address))
+            except Exception as e:
+                print(str(e))
+    except asyncio.CancelledError:
+        print("[handle_connections] Coroutine cancelled....")
+
+
+def get_args():
+    parser = argparse.ArgumentParser(description="A script to start an async server") 
+    parser.add_argument('-p', '--port', type=int, help='Port to start the HTTP server at.') 
+    args = parser.parse_args()
+    if args.port is None:
+        raise ValueError("Please specify port # using -p")
+    return args
+
+def main():
+    args = get_args()
+    server_host = util.LOCALHOST
+    server_port = args.port
+    server_socket = None
+    try:
+        server_socket = util.setup_server(server_host, server_port)
+    except Exception as e:
+        print(str(e))
+        print("setup_server failed! Exiting...")
+        return
+    
+    if server_socket is None:
+        print("Invalid server socket. Exiting")
+        return
+    
+    try:
+        asyncio.run(handle_connections(server_socket))
+    except KeyboardInterrupt:
+        print(f"\nExiting due to a Keyboard interrupt\n")
+    finally:
+        print("Server is shutting down.")
+        # Close the server socket
+        if server_socket:
+            server_socket.close()
+
+
+if __name__ == "__main__":
+    main()
